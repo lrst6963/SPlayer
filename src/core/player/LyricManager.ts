@@ -7,6 +7,7 @@ import { type SongLyric } from "@/types/lyric";
 import { isElectron } from "@/utils/env";
 import { stripLyricMetadata } from "@/utils/lyricStripper";
 import { type LyricLine, parseLrc, parseTTML, parseYrc } from "@applemusic-like-lyrics/lyric";
+import { parseSmartLrc, isWordLevelFormat } from "@/utils/lyricParser";
 import { escapeRegExp, isEmpty } from "lodash-es";
 import { SongType } from "@/types/main";
 
@@ -505,9 +506,15 @@ class LyricManager {
         statusStore.usingTTMLLyric = true;
         return { lrcData: [], yrcData: lines };
       }
-      // 解析本地歌词
-      const lrcLines = parseLrc(lyric);
-      let aligned = this.alignLocalLyrics({ lrcData: lrcLines, yrcData: [] });
+      // 解析本地歌词（智能识别格式）
+      const { format: lrcFormat, lines: parsedLines } = parseSmartLrc(lyric);
+      // 如果是逐字格式，直接作为 yrcData
+      if (isWordLevelFormat(lrcFormat)) {
+        statusStore.usingTTMLLyric = false;
+        return { lrcData: [], yrcData: parsedLines };
+      }
+      // 普通格式，继续原有逻辑
+      let aligned = this.alignLocalLyrics({ lrcData: parsedLines, yrcData: [] });
       statusStore.usingTTMLLyric = false;
       // 如果开启了本地歌曲 QQ 音乐匹配，尝试获取逐字歌词
       if (settingStore.localLyricQQMusicMatch && musicStore.playSong) {
@@ -557,12 +564,8 @@ class LyricManager {
         const aLang = (a.getAttribute("xml:lang") || a.getAttribute("lang") || "").toLowerCase();
         const bLang = (b.getAttribute("xml:lang") || b.getAttribute("lang") || "").toLowerCase();
 
-        const aIndex = translationOrder.findIndex((lang) =>
-          aLang.startsWith(lang.toLowerCase()),
-        );
-        const bIndex = translationOrder.findIndex((lang) =>
-          bLang.startsWith(lang.toLowerCase()),
-        );
+        const aIndex = translationOrder.findIndex((lang) => aLang.startsWith(lang.toLowerCase()));
+        const bIndex = translationOrder.findIndex((lang) => bLang.startsWith(lang.toLowerCase()));
 
         // 如果找不到指定语言，则放在最后
         return (aIndex === -1 ? Infinity : aIndex) - (bIndex === -1 ? Infinity : bIndex);
@@ -599,20 +602,23 @@ class LyricManager {
         id,
       );
       statusStore.usingTTMLLyric = Boolean(ttml);
-      let lrcLines: LyricLine[] = [];
-      let ttmlLines: LyricLine[] = [];
       // 安全解析 LRC
+      let lrcLines: LyricLine[] = [];
+      let lrcIsWordLevel = false;
       try {
         const lrcContent = typeof lrc === "string" ? lrc : "";
         if (lrcContent) {
-          lrcLines = parseLrc(lrcContent);
-          console.log("检测到本地歌词覆盖", lrcLines);
+          const { format: lrcFormat, lines } = parseSmartLrc(lrcContent);
+          lrcIsWordLevel = isWordLevelFormat(lrcFormat);
+          lrcLines = lines;
+          console.log("检测到本地歌词覆盖", lrcFormat, lrcLines);
         }
       } catch (err) {
         console.error("parseLrc 本地解析失败:", err);
         lrcLines = [];
       }
       // 安全解析 TTML
+      let ttmlLines: LyricLine[] = [];
       try {
         const ttmlContent = typeof ttml === "string" ? ttml : "";
         if (ttmlContent) {
@@ -623,6 +629,9 @@ class LyricManager {
         console.error("parseTTML 本地解析失败:", err);
         statusStore.usingTTMLLyric = false;
         ttmlLines = [];
+      }
+      if (lrcIsWordLevel && lrcLines.length > 0) {
+        return { lrcData: [], yrcData: lrcLines };
       }
       return { lrcData: lrcLines, yrcData: ttmlLines };
     } catch (error) {
