@@ -552,15 +552,16 @@ class LyricManager {
       );
 
       // 按照指定顺序对翻译进行排序
+      // 按照指定顺序对翻译进行排序
       translationElements.sort((a, b) => {
-        const aLang = a.getAttribute("xml:lang") || a.getAttribute("lang") || "";
-        const bLang = b.getAttribute("xml:lang") || b.getAttribute("lang") || "";
+        const aLang = (a.getAttribute("xml:lang") || a.getAttribute("lang") || "").toLowerCase();
+        const bLang = (b.getAttribute("xml:lang") || b.getAttribute("lang") || "").toLowerCase();
 
         const aIndex = translationOrder.findIndex((lang) =>
-          aLang.toLowerCase().includes(lang.toLowerCase()),
+          aLang.startsWith(lang.toLowerCase()),
         );
         const bIndex = translationOrder.findIndex((lang) =>
-          bLang.toLowerCase().includes(lang.toLowerCase()),
+          bLang.startsWith(lang.toLowerCase()),
         );
 
         // 如果找不到指定语言，则放在最后
