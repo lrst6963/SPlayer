@@ -1,53 +1,19 @@
 import { nativeImage } from "electron";
 import { join, basename } from "path";
-import { readFile, mkdir } from "fs/promises";
+import { mkdir } from "fs/promises";
 import { CacheService } from "./CacheService";
 import { existsSync } from "fs";
 import { createHash } from "crypto";
 import { useStore } from "../store";
 import { type IAudioMetadata, parseFile } from "music-metadata";
+import { LocalMusicDB, type MusicTrack } from "../database/LocalMusicDB";
 import FastGlob, { type Entry } from "fast-glob";
 import pLimit from "p-limit";
 
-/** 当前本地音乐库 DB 版本，用于控制缓存结构升级 */
-const CURRENT_DB_VERSION = 2;
-
-/** 音乐数据接口 */
-export interface MusicTrack {
-  /** 文件id */
-  id: string;
-  /** 文件路径 */
-  path: string;
-  /** 文件标题 */
-  title: string;
-  /** 文件艺术家 */
-  artist: string;
-  /** 文件专辑 */
-  album: string;
-  /** 文件时长 */
-  duration: number;
-  /** 文件封面 */
-  cover?: string;
-  /** 文件修改时间 */
-  mtime: number;
-  /** 文件大小 */
-  size: number;
-  /** 文件码率（bps） */
-  bitrate?: number;
-}
-
-/** 音乐库数据库接口 */
-interface MusicLibraryDB {
-  /** 版本号 */
-  version: number;
-  /** 文件列表 */
-  tracks: Record<string, MusicTrack>;
-}
-
 /** 本地音乐服务 */
 export class LocalMusicService {
-  /** 数据库 */
-  private db: MusicLibraryDB = { version: CURRENT_DB_VERSION, tracks: {} };
+  /** 数据库实例 */
+  private db: LocalMusicDB | null = null;
   /** 限制并发解析数为 10，防止内存溢出 */
   private limit = pLimit(10);
   /** 运行锁：防止并发扫描 */
@@ -64,7 +30,8 @@ export class LocalMusicService {
     const store = useStore();
     const localCachePath = join(store.get("cachePath"), "local-data");
     return {
-      dbPath: join(localCachePath, "library.json"),
+      dbPath: join(localCachePath, "library.db"),
+      jsonPath: join(localCachePath, "library.json"),
       coverDir: join(localCachePath, "covers"),
       cacheDir: localCachePath,
     };
@@ -72,12 +39,15 @@ export class LocalMusicService {
 
   /** 初始化 */
   private async ensureInitialized(): Promise<void> {
-    const { dbPath, coverDir } = this.paths;
+    const { dbPath, jsonPath, coverDir } = this.paths;
 
     // 如果路径变了，强制重新初始化
     if (this.lastDbPath && this.lastDbPath !== dbPath) {
       this.initPromise = null;
-      this.db = { version: CURRENT_DB_VERSION, tracks: {} };
+      if (this.db) {
+        this.db.close();
+        this.db = null;
+      }
     }
     this.lastDbPath = dbPath;
 
@@ -89,40 +59,16 @@ export class LocalMusicService {
       if (!existsSync(coverDir)) {
         await mkdir(coverDir, { recursive: true });
       }
-      await this.loadDB();
+
+      if (!this.db) {
+        this.db = new LocalMusicDB(dbPath);
+        this.db.init();
+      }
+
+      await this.db.migrateFromJsonIfNeeded(jsonPath);
     })();
 
     return this.initPromise;
-  }
-
-  /** 加载数据库 */
-  private async loadDB() {
-    const { dbPath } = this.paths;
-    try {
-      if (existsSync(dbPath)) {
-        const data = await readFile(dbPath, "utf-8");
-        const parsed = JSON.parse(data) as MusicLibraryDB;
-        // 如果历史 DB 没有版本号或版本过旧，则重建
-        if (!parsed.version || parsed.version < CURRENT_DB_VERSION) {
-          this.db = { version: CURRENT_DB_VERSION, tracks: {} };
-        } else {
-          this.db = parsed;
-        }
-      } else {
-        this.db = { version: CURRENT_DB_VERSION, tracks: {} };
-      }
-    } catch (e) {
-      console.error("Failed to load DB, resetting:", e);
-      this.db = { version: CURRENT_DB_VERSION, tracks: {} };
-    }
-  }
-
-  /** 保存数据库 */
-  private async saveDB() {
-    const cacheService = CacheService.getInstance();
-    // 确保版本号始终为当前版本
-    this.db.version = CURRENT_DB_VERSION;
-    await cacheService.put("local-data", "library.json", JSON.stringify(this.db));
   }
 
   /** 获取文件id */
@@ -179,7 +125,7 @@ export class LocalMusicService {
     onProgress?: (current: number, total: number) => void,
     onTracksBatch?: (tracks: MusicTrack[]) => void,
   ) {
-    const { dbPath, coverDir, cacheDir } = this.paths;
+    const { coverDir, cacheDir } = this.paths;
 
     // 运行锁：如果正在刷新，抛出特定错误
     if (this.isRefreshing) {
@@ -187,25 +133,22 @@ export class LocalMusicService {
       throw new Error("SCAN_IN_PROGRESS");
     }
 
-    if (!dirPaths || dirPaths.length === 0) {
-      // 如果没有目录，清空数据库并保存
-      if (Object.keys(this.db.tracks).length > 0) {
-        this.db.tracks = {};
-        await this.saveDB();
-      }
-      return [];
-    }
     // 确保初始化完成
     await this.ensureInitialized();
-    // 检查数据库文件是否被人为删除，如果是，则重置内存数据
-    if (!existsSync(dbPath)) {
-      this.db = { version: CURRENT_DB_VERSION, tracks: {} };
+    if (!this.db) throw new Error("DB not initialized");
+
+    if (!dirPaths || dirPaths.length === 0) {
+      // 如果没有目录，清空数据库
+      this.db.clearTracks();
+      return [];
     }
+
     // 检查封面目录是否被人为删除，如果是，则重建
     if (!existsSync(coverDir)) {
       await mkdir(coverDir, { recursive: true });
     }
     this.isRefreshing = true;
+
     // 音乐文件扩展名
     const musicExtensions = ["mp3", "wav", "flac", "aac", "webm", "m4a", "ogg", "aiff", "aif"];
     // 构造 Glob 模式数组
@@ -223,8 +166,6 @@ export class LocalMusicService {
     const totalFiles = entries.length;
     /** 已处理文件数 */
     let processedCount = 0;
-    /** 是否脏数据 */
-    let isDirty = false;
     // 用于记录本次扫描到的文件路径，用于后续清理"不存在的文件"
     const scannedPaths = new Set<string>();
     // 批量发送缓冲区
@@ -255,8 +196,10 @@ export class LocalMusicService {
           // 小于 1MB 的文件不处理
           if (size < 1024 * 1024) return;
           scannedPaths.add(filePath);
+
           /** 缓存 */
-          const cached = this.db.tracks[filePath];
+          const cached = this.db!.getTrack(filePath);
+
           // 判断是否可以使用缓存
           let useCache = false;
           if (cached && cached.mtime === mtime && cached.size === size) {
@@ -305,17 +248,12 @@ export class LocalMusicService {
               cover: coverPath,
               bitrate: metadata.format.bitrate ?? 0,
             };
-            // 添加到数据库
-            this.db.tracks[filePath] = track;
-            isDirty = true;
-            // 添加到批量缓冲区
-            tracksBuffer.push(track);
-            // 达到批量大小，发送一批
-            if (tracksBuffer.length >= BATCH_SIZE) {
-              flushBatch();
-            }
+
+            // 返回 track，在 limit 外面处理写入
+            return track;
           } catch (err) {
             console.warn(`Parse error [${filePath}]:`, err);
+            return undefined;
           } finally {
             processedCount++;
             // 节流发送进度
@@ -325,26 +263,51 @@ export class LocalMusicService {
           }
         });
       });
-      // 等待当前批次完成，释放闭包引用，避免内存积压
-      await Promise.all(tasks);
-    }
-    // 发送最后一批数据
-    flushBatch();
-    // 清理脏数据 (处理文件删除 或 移除文件夹的情况)
-    // 遍历数据库中现有的所有路径
-    const dbPaths = Object.keys(this.db.tracks);
-    for (const dbPath of dbPaths) {
-      if (!scannedPaths.has(dbPath)) {
-        delete this.db.tracks[dbPath];
-        isDirty = true;
+
+      // 等待当前批次完成
+      const results = await Promise.all(tasks);
+
+      // 过滤出新的/更新的 tracks
+      const newTracks = results.filter((t): t is MusicTrack => t !== undefined);
+
+      // 批量写入 DB
+      if (newTracks.length > 0) {
+        this.db.addTracks(newTracks);
+        tracksBuffer.push(...newTracks);
+      }
+
+      if (tracksBuffer.length >= BATCH_SIZE) {
+        flushBatch();
       }
     }
-    // 持久化
-    // 如果有脏数据，或者数据库文件不存在（即使isDirty为false），都进行保存
-    if (isDirty || !existsSync(dbPath)) await this.saveDB();
+
+    // 发送最后一批数据
+    flushBatch();
+
+    // 清理脏数据 (处理文件删除 或 移除文件夹的情况)
+    const allPaths = this.db.getAllPaths();
+    const pathsToDelete: string[] = [];
+    for (const path of allPaths) {
+      if (!scannedPaths.has(path)) {
+        pathsToDelete.push(path);
+      }
+    }
+
+    if (pathsToDelete.length > 0) {
+      this.db.deleteTracks(pathsToDelete);
+    }
+
     // 释放运行锁
     this.isRefreshing = false;
+
     // 返回所有数据
-    return Object.values(this.db.tracks);
+    return this.db.getAllTracks();
+  }
+
+  /** 获取所有音乐 */
+  async getAllTracks(): Promise<MusicTrack[]> {
+    await this.ensureInitialized();
+    if (!this.db) return [];
+    return this.db.getAllTracks();
   }
 }

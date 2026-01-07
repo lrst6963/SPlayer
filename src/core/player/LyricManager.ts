@@ -217,8 +217,13 @@ class LyricManager {
       let lrcLines = parseLrc(data.lrc) || [];
       // 处理翻译
       if (data.trans) {
-        const transLines = parseLrc(data.trans);
+        let transLines = parseLrc(data.trans);
         if (transLines?.length) {
+          // 过滤包含 "//" 或 "作品的著作权" 的翻译行
+          transLines = transLines.filter((line) => {
+            const text = line.words.map((w) => w.word).join("");
+            return !text.includes("//") && !text.includes("作品的著作权");
+          });
           lrcLines = this.alignLyrics(lrcLines, transLines, "translatedLyric");
         }
       }
@@ -341,8 +346,13 @@ class LyricManager {
     // 处理翻译
     let result = lines;
     if (trans) {
-      const transLines = parseLrc(trans);
+      let transLines = parseLrc(trans);
       if (transLines?.length) {
+        // 过滤包含 "//" 或 "作品的著作权" 的翻译行
+        transLines = transLines.filter((line) => {
+          const text = line.words.map((w) => w.word).join("");
+          return !text.includes("//") && !text.includes("作品的著作权");
+        });
         result = this.alignLyrics(result, transLines, "translatedLyric");
       }
     }

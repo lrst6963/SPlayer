@@ -1,20 +1,16 @@
 import { join, resolve, dirname } from "path";
 import { existsSync } from "fs";
 import { readdir, readFile, rm, stat, writeFile, mkdir, utimes } from "fs/promises";
-import { gzip, gunzip } from "zlib";
-import { promisify } from "util";
 import { useStore } from "../store";
 import { cacheLog } from "../logger";
-
-const gzipAsync = promisify(gzip);
-const gunzipAsync = promisify(gunzip);
+import { CacheDB } from "../database/CacheDB";
 
 /**
  * 缓存资源类型
- * - music: 音乐缓存
- * - lyrics: 歌词缓存
- * - local-data: 本地音乐数据缓存
- * - list-data: 列表数据缓存（歌单/专辑/电台）
+ * - music: 音乐缓存 (文件)
+ * - lyrics: 歌词缓存 (DB)
+ * - local-data: 本地音乐数据缓存 (文件)
+ * - list-data: 列表数据缓存（歌单/专辑/电台） (DB)
  */
 export type CacheResourceType = "music" | "lyrics" | "local-data" | "list-data";
 
@@ -35,14 +31,18 @@ export interface CacheListItem {
 export class CacheService {
   private static instance: CacheService;
 
-  /** 各类型缓存大小 */
-  private sizes: Record<CacheResourceType, number> = {
+  /** 数据库实例 */
+  private db: CacheDB | null = null;
+
+  /** 各类型缓存大小 (仅用于文件类型缓存) */
+  private fileSizes: Record<string, number> = {
     music: 0,
-    lyrics: 0,
     "local-data": 0,
-    "list-data": 0,
   };
 
+  /** 上次清理时间 */
+  private lastCleanupTime: number = 0;
+  /** 是否已初始化 */
   private isInitialized: boolean = false;
 
   private readonly CACHE_SUB_DIR: Record<CacheResourceType, string> = {
@@ -74,7 +74,7 @@ export class CacheService {
   }
 
   /**
-   * 解析并校验缓存文件路径
+   * 解析并校验缓存文件路径 (仅用于文件类型缓存)
    */
   private resolveSafePath(type: CacheResourceType, key: string) {
     const basePath = this.getCacheBasePath();
@@ -124,7 +124,7 @@ export class CacheService {
   }
 
   /**
-   * 初始化服务，计算初始大小
+   * 初始化服务，计算初始大小，并初始化 DB
    */
   public async init(): Promise<void> {
     if (this.isInitialized) return;
@@ -135,7 +135,12 @@ export class CacheService {
       // 确保目录存在
       if (!existsSync(basePath)) await mkdir(basePath, { recursive: true });
 
-      for (const type of Object.keys(this.CACHE_SUB_DIR) as CacheResourceType[]) {
+      // 初始化 DB
+      const dbPath = join(basePath, "cache.db");
+      this.db = new CacheDB(dbPath);
+
+      // 初始化文件缓存 (music, local-data)
+      for (const type of ["music", "local-data"] as CacheResourceType[]) {
         const dir = join(basePath, this.CACHE_SUB_DIR[type]);
         if (!existsSync(dir)) {
           await mkdir(dir, { recursive: true });
@@ -153,11 +158,22 @@ export class CacheService {
           }
         }
         // 计算初始大小
-        this.sizes[type] = await this.calculateDirSize(dir);
+        this.fileSizes[type] = await this.calculateDirSize(dir);
+      }
+
+      // 清理旧的文件缓存目录
+      for (const type of ["list-data", "lyrics"] as CacheResourceType[]) {
+        const dir = join(basePath, this.CACHE_SUB_DIR[type]);
+        if (existsSync(dir)) {
+          await rm(dir, { recursive: true, force: true });
+        }
       }
 
       this.isInitialized = true;
-      cacheLog.info("CacheService initialized. Sizes:", this.sizes);
+      cacheLog.info("CacheService initialized.");
+
+      // 启动时触发一次清理检查
+      this.checkAndCleanCache().catch((e) => cacheLog.warn("Startup cache cleanup failed:", e));
     } catch (error) {
       cacheLog.error("CacheService init failed:", error);
     }
@@ -168,16 +184,34 @@ export class CacheService {
    */
   public async getSize(): Promise<number> {
     await this.init();
-    return Object.values(this.sizes).reduce((a, b) => a + b, 0);
+    const fileTotal = Object.values(this.fileSizes).reduce((a, b) => a + b, 0);
+
+    // 计算 DB 文件实际占用大小 (包括 wal 和 shm)
+    let dbTotal = 0;
+    const basePath = this.getCacheBasePath();
+    const dbPath = join(basePath, "cache.db");
+
+    try {
+      if (existsSync(dbPath)) dbTotal += (await stat(dbPath)).size;
+      if (existsSync(dbPath + "-wal")) dbTotal += (await stat(dbPath + "-wal")).size;
+      if (existsSync(dbPath + "-shm")) dbTotal += (await stat(dbPath + "-shm")).size;
+    } catch (e) {
+      // ignore
+    }
+
+    return fileTotal + dbTotal;
   }
 
   /**
-   * 获取缓存文件路径
+   * 获取缓存文件路径 (仅用于文件类型缓存)
    * @param type 缓存类型
    * @param key 缓存 key
    * @returns 缓存文件路径
    */
   public getFilePath(type: CacheResourceType, key: string): string {
+    if (type === "lyrics" || type === "list-data") {
+      throw new Error(`Type ${type} is stored in DB, no file path available.`);
+    }
     const { target } = this.resolveSafePath(type, key);
     return target;
   }
@@ -187,11 +221,13 @@ export class CacheService {
    */
   public async notifyFileChange(type: CacheResourceType, key: string): Promise<void> {
     await this.init();
+    if (type === "lyrics" || type === "list-data") return;
+
     // 确保 key 合法性
     this.resolveSafePath(type, key);
     const basePath = this.getCacheBasePath();
     const dir = join(basePath, this.CACHE_SUB_DIR[type]);
-    this.sizes[type] = await this.calculateDirSize(dir);
+    this.fileSizes[type] = await this.calculateDirSize(dir);
   }
 
   /**
@@ -203,47 +239,39 @@ export class CacheService {
     data: Buffer | Uint8Array | ArrayBuffer | string,
   ): Promise<void> {
     await this.init();
-
-    const { target } = this.resolveSafePath(type, key);
     const buffer = this.toBuffer(data);
 
     // 检查并清理超限缓存
     await this.checkAndCleanCache();
 
-    // 检查旧文件大小
-    let oldSize = 0;
-    try {
-      if (existsSync(target)) {
-        const info = await stat(target);
-        oldSize = info.size;
-      }
-    } catch {
-      // ignore
-    }
+    if (type === "lyrics" || type === "list-data") {
+      this.db?.put(key, type, buffer);
+    } else {
+      // 存入文件
+      const { target } = this.resolveSafePath(type, key);
 
-    // 确保父目录存在
-    const parentDir = dirname(target);
-    if (!existsSync(parentDir)) {
-      await mkdir(parentDir, { recursive: true });
-    }
-
-    // 如果是 list-data，进行 Gzip 压缩
-    let dataToWrite = buffer;
-    if (type === "list-data") {
+      // 检查旧文件大小
+      let oldSize = 0;
       try {
-        dataToWrite = await gzipAsync(buffer);
-      } catch (e) {
-        cacheLog.error("Gzip compression failed:", e);
-        // 降级为不压缩? 或者抛出错误?
-        // 这里选择抛出，保证数据一致性（读取时会尝试解压）
-        throw e;
+        if (existsSync(target)) {
+          const info = await stat(target);
+          oldSize = info.size;
+        }
+      } catch {
+        // ignore
       }
+
+      // 确保父目录存在
+      const parentDir = dirname(target);
+      if (!existsSync(parentDir)) {
+        await mkdir(parentDir, { recursive: true });
+      }
+
+      await writeFile(target, buffer);
+
+      // 更新大小记录
+      this.fileSizes[type] = this.fileSizes[type] - oldSize + buffer.length;
     }
-
-    await writeFile(target, dataToWrite);
-
-    // 更新大小记录
-    this.sizes[type] = this.sizes[type] - oldSize + dataToWrite.length;
   }
 
   /**
@@ -256,6 +284,9 @@ export class CacheService {
 
     // 如果设置为 0，则不限制
     if (limitSizeGB <= 0) return;
+
+    // 节流：每 10 分钟最多执行一次清理检查
+    if (Date.now() - this.lastCleanupTime < 10 * 60 * 1000) return;
 
     const limitSizeBytes = limitSizeGB * 1024 * 1024 * 1024;
     const currentSize = await this.getSize();
@@ -283,12 +314,13 @@ export class CacheService {
           freedSize += item.size;
           cacheLog.info(`Cleaned cache: ${cacheType}/${item.key}, size: ${item.size}`);
         } catch (e) {
-          cacheLog.warn(`Failed to remove cache file: ${item.key}`, e);
+          cacheLog.warn(`Failed to remove cache: ${item.key}`, e);
         }
       }
     }
 
     cacheLog.info(`Cache cleanup completed. Freed: ${freedSize} bytes`);
+    this.lastCleanupTime = Date.now();
   }
 
   /**
@@ -296,32 +328,26 @@ export class CacheService {
    */
   public async get(type: CacheResourceType, key: string): Promise<Buffer | null> {
     await this.init();
-    const { target } = this.resolveSafePath(type, key);
-    if (!existsSync(target)) return null;
 
-    // 手动更新 atime (最后访问时间)，实现 LRU 逻辑
-    try {
-      const now = new Date();
-      await utimes(target, now, now);
-    } catch (e) {
-      // 忽略 utimes 失败
-    }
+    if (type === "lyrics" || type === "list-data") {
+      const entry = this.db?.get(key);
+      if (!entry || entry.type !== type) return null;
 
-    const buffer = await readFile(target);
+      return entry.data;
+    } else {
+      const { target } = this.resolveSafePath(type, key);
+      if (!existsSync(target)) return null;
 
-    // 如果是 list-data，进行 Gzip 解压
-    if (type === "list-data") {
+      // 手动更新 atime (最后访问时间)，实现 LRU 逻辑
       try {
-        return await gunzipAsync(buffer);
+        const now = new Date();
+        await utimes(target, now, now);
       } catch (e) {
-        cacheLog.error("Gzip decompression failed:", e);
-        // 如果解压失败，可能是旧的未压缩数据？
-        // 尝试直接返回原数据（兼容旧数据）
-        return buffer;
+        // 忽略 utimes 失败
       }
-    }
 
-    return buffer;
+      return await readFile(target);
+    }
   }
 
   /**
@@ -329,12 +355,17 @@ export class CacheService {
    */
   public async remove(type: CacheResourceType, key: string): Promise<void> {
     await this.init();
-    const { target } = this.resolveSafePath(type, key);
 
-    if (existsSync(target)) {
-      const info = await stat(target);
-      await rm(target, { force: true });
-      this.sizes[type] = Math.max(0, this.sizes[type] - info.size);
+    if (type === "lyrics" || type === "list-data") {
+      this.db?.remove(key);
+    } else {
+      const { target } = this.resolveSafePath(type, key);
+
+      if (existsSync(target)) {
+        const info = await stat(target);
+        await rm(target, { force: true });
+        this.fileSizes[type] = Math.max(0, this.fileSizes[type] - info.size);
+      }
     }
   }
 
@@ -343,13 +374,18 @@ export class CacheService {
    */
   public async clear(type: CacheResourceType): Promise<void> {
     await this.init();
-    const basePath = this.getCacheBasePath();
-    const dir = join(basePath, this.CACHE_SUB_DIR[type]);
 
-    await rm(dir, { recursive: true, force: true });
-    if (!existsSync(dir)) await mkdir(dir, { recursive: true });
+    if (type === "lyrics" || type === "list-data") {
+      this.db?.clear(type);
+    } else {
+      const basePath = this.getCacheBasePath();
+      const dir = join(basePath, this.CACHE_SUB_DIR[type]);
 
-    this.sizes[type] = 0;
+      await rm(dir, { recursive: true, force: true });
+      if (!existsSync(dir)) await mkdir(dir, { recursive: true });
+
+      this.fileSizes[type] = 0;
+    }
   }
 
   /**
@@ -357,54 +393,37 @@ export class CacheService {
    */
   public async list(type: CacheResourceType): Promise<CacheListItem[]> {
     await this.init();
-    const basePath = this.getCacheBasePath();
-    const dir = join(basePath, this.CACHE_SUB_DIR[type]);
 
-    if (!existsSync(dir)) return [];
+    if (type === "lyrics" || type === "list-data") {
+      const entries = this.db?.list(type) || [];
+      return entries.map((e) => ({
+        key: e.key,
+        size: e.size,
+        atime: e.atime,
+        mtime: e.mtime,
+      }));
+    } else {
+      const basePath = this.getCacheBasePath();
+      const dir = join(basePath, this.CACHE_SUB_DIR[type]);
 
-    const files = await readdir(dir, { withFileTypes: true });
-    const items: CacheListItem[] = [];
+      if (!existsSync(dir)) return [];
 
-    for (const file of files) {
-      if (!file.isFile()) continue;
-      const filePath = join(dir, file.name);
-      const info = await stat(filePath);
-      items.push({
-        key: file.name,
-        size: info.size,
-        atime: info.atimeMs,
-        mtime: info.mtimeMs,
-      });
-    }
+      const files = await readdir(dir, { withFileTypes: true });
+      const items: CacheListItem[] = [];
 
-    return items;
-  }
-
-  /**
-   * 清理旧缓存
-   * @param type 缓存类型
-   * @param targetFreeSize 需要腾出的空间大小
-   */
-  public async cleanOldCache(type: CacheResourceType, targetFreeSize: number): Promise<void> {
-    await this.init();
-    let freedSize = 0;
-    const items = await this.list(type);
-
-    // 按 atime 升序排序 (最久未访问的在前)
-    items.sort((a, b) => a.atime - b.atime);
-
-    for (const item of items) {
-      if (freedSize >= targetFreeSize) break;
-      try {
-        await this.remove(type, item.key);
-        freedSize += item.size;
-        cacheLog.info(`Cleaned old cache: ${type}/${item.key}, size: ${item.size}`);
-      } catch (e) {
-        cacheLog.warn(`Failed to remove cache file: ${item.key}`, e);
+      for (const file of files) {
+        if (!file.isFile()) continue;
+        const filePath = join(dir, file.name);
+        const info = await stat(filePath);
+        items.push({
+          key: file.name,
+          size: info.size,
+          atime: info.atimeMs,
+          mtime: info.mtimeMs,
+        });
       }
-    }
 
-    // 重新计算该类型的准确大小，确保数据一致
-    await this.notifyFileChange(type, "");
+      return items;
+    }
   }
 }
