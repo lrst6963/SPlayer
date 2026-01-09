@@ -32,6 +32,13 @@ const initSystemIpc = (): void => {
     app.quit();
   });
 
+  // 重启应用
+  ipcMain.on("restart-app", () => {
+    ipcLog.info("🔄 Restarting application...");
+    app.relaunch();
+    app.exit(0);
+  });
+
   // 获取系统全部字体
   ipcMain.handle("get-all-fonts", async () => {
     try {

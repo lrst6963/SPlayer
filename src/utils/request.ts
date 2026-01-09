@@ -1,5 +1,5 @@
 import axios, { AxiosInstance, AxiosRequestConfig, AxiosError, AxiosResponse } from "axios";
-import { isDev, isElectron } from "./env";
+import { isDev } from "./env";
 import { useSettingStore } from "@/stores";
 import { getCookie } from "./cookie";
 import { isLogin } from "./auth";
@@ -32,11 +32,7 @@ server.interceptors.request.use(
     // Cookie
     if (!request.params.noCookie && (isLogin() || getCookie("MUSIC_U") !== null)) {
       const cookie = `MUSIC_U=${getCookie("MUSIC_U")};`;
-      request.params.cookie = encodeURIComponent(cookie);
-    }
-    // realIP
-    if (!isElectron && !request.url?.includes("/login")) {
-      request.params.realIP = "116.25.146.177";
+      request.params.cookie = cookie;
     }
     // 自定义 realIP
     if (settingStore.useRealIP) {

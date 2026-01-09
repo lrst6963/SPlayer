@@ -90,6 +90,24 @@
           class="set"
         />
       </n-card>
+      <n-card class="set-item">
+        <div class="label">
+          <n-text class="name">
+            音频播放引擎
+            <n-tag type="warning" size="small" round> Beta </n-tag>
+          </n-text>
+          <n-text class="tip" :depth="3">
+            {{ audioEngineData[settingStore.audioEngine]?.tip }} <br />
+            <n-text type="warning">需重启生效</n-text>
+          </n-text>
+        </div>
+        <n-select
+          :value="settingStore.audioEngine"
+          :options="Object.values(audioEngineData)"
+          class="set"
+          @update:value="handleEngineChange"
+        />
+      </n-card>
       <n-card v-if="!isElectron" class="set-item">
         <div class="label">
           <n-text class="name">播放试听</n-text>
@@ -116,7 +134,13 @@
         <div class="label">
           <n-text class="name">音频输出设备</n-text>
           <n-text class="tip" :depth="3">
-            {{ settingStore.playbackEngine === 'mpv' ? 'MPV 引擎暂不支持手动切换输出设备' : '新增或移除音频设备后请重新打开设置' }}
+            {{
+              settingStore.playbackEngine === 'mpv'
+                ? 'MPV 引擎暂不支持手动切换输出设备'
+                : settingStore.audioEngine === 'ffmpeg'
+                ? 'FFmpeg 引擎不支持切换输出设备'
+                : '新增或移除音频设备后请重新打开设置'
+            }}
           </n-text>
         </div>
         <n-select
@@ -124,7 +148,7 @@
           class="set"
           :options="outputDevices"
           :render-option="renderOption"
-          :disabled="settingStore.playbackEngine === 'mpv'"
+          :disabled="settingStore.playbackEngine === 'mpv' || settingStore.audioEngine === 'ffmpeg'"
           @update:value="playDeviceChange"
         />
       </n-card>
@@ -362,14 +386,14 @@
 </template>
 
 <script setup lang="ts">
-import type { SelectOption } from "naive-ui";
+import { usePlayerController } from "@/core/player/PlayerController";
 import { useSettingStore } from "@/stores";
 import { isLogin } from "@/utils/auth";
-import { renderOption } from "@/utils/helper";
 import { isElectron } from "@/utils/env";
-import { uniqBy } from "lodash-es";
-import { usePlayerController } from "@/core/player/PlayerController";
+import { renderOption } from "@/utils/helper";
 import { openSongUnlockManager } from "@/utils/modal";
+import { uniqBy } from "lodash-es";
+import type { SelectOption } from "naive-ui";
 
 const player = usePlayerController();
 const settingStore = useSettingStore();
@@ -407,6 +431,20 @@ const playbackEngineChange = async (engine: PlaybackEngine) => {
 
 // 显示音乐频谱
 const showSpectrums = ref<boolean>(settingStore.showSpectrums);
+
+// 音频引擎数据
+const audioEngineData = {
+  element: {
+    label: "Web Audio",
+    value: "element",
+    tip: "浏览器原生播放引擎，稳定可靠占用低，但不支持部分音频格式",
+  },
+  ffmpeg: {
+    label: "FFmpeg",
+    value: "ffmpeg",
+    tip: "FFmpeg 播放引擎，支持更多音频格式，但不支持部分功能，如倍速播放",
+  },
+};
 
 // 音质数据
 const songLevelData = {
@@ -502,6 +540,34 @@ const playDeviceChange = (deviceId: string, option: SelectOption) => {
 const showSpectrumsChange = (value: boolean) => {
   showSpectrums.value = value;
   settingStore.showSpectrums = value;
+};
+
+// 处理音频引擎切换
+const handleEngineChange = (newEngine: "element" | "ffmpeg") => {
+  const oldEngine = settingStore.audioEngine;
+  if (newEngine === oldEngine) return;
+
+  // 先保存新的引擎设置
+  settingStore.audioEngine = newEngine;
+
+  // 弹出确认对话框
+  window.$dialog.warning({
+    title: "切换音频引擎",
+    content: "音频引擎切换需要重启应用才能生效。是否立即重启？",
+    positiveText: "立即重启",
+    negativeText: "稍后",
+    onPositiveClick: () => {
+      // 立即重启应用
+      if (isElectron) {
+        window.electron.ipcRenderer.send("restart-app");
+      } else {
+        window.location.reload();
+      }
+    },
+    onNegativeClick: () => {
+      window.$message.info("引擎将在下次启动时生效");
+    },
+  });
 };
 
 onMounted(() => {

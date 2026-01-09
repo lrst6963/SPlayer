@@ -1,118 +1,73 @@
-/**
- * @file AudioManager.ts
- * @description 封装原生 AudioContext 与 HTMLAudioElement 的高级音频管理器
- * @author imsyy
- */
-
-/** 扩充 AudioContext 接口以支持 setSinkId (实验性 API) */
-interface IExtendedAudioContext extends AudioContext {
-  setSinkId(deviceId: string): Promise<void>;
-}
-
-/**
- * 音频事件类型定义
- */
-export type AudioEventType =
-  | "play"
-  | "pause"
-  | "ended"
-  | "timeupdate"
-  | "error"
-  | "waiting"
-  | "canplay"
-  | "loadedmetadata"
-  | "loadstart"
-  | "volumechange"
-  | "seeking"
-  | "seeked";
+import { useSettingStore } from "@/stores";
+import { AudioElementPlayer } from "../audio-player/AudioElementPlayer";
+import {
+  AUDIO_EVENTS,
+  AudioEventType,
+  BaseAudioPlayer,
+  type AudioEventMap,
+} from "../audio-player/BaseAudioPlayer";
+import { FFmpegAudioPlayer } from "../audio-player/ffmpeg-engine/FFmpegAudioPlayer";
 
 /**
- * 音频管理器类
+ * 音频管理器
+ *
+ * 职责：作为 Facade 统一对外暴露接口，持有具体的播放器实现 (AudioElementPlayer 或 FFmpegPlayer)
+ * 并负责事件的转发
  */
-class AudioManager {
-  /** 核心上下文 */
-  private audioCtx: IExtendedAudioContext | null = null;
-  /** 音频元素 */
-  private audioElement: HTMLAudioElement | null = null;
+class AudioManager extends EventTarget {
+  /** 当前活动的播放器实现 */
+  private player: BaseAudioPlayer;
+  /** 用于清理当前 player 的事件监听器 */
+  private cleanupListeners: (() => void) | null = null;
+  /** 当前引擎类型 */
+  public readonly engineType: "ffmpeg" | "element";
 
-  /** 音频源节点 */
-  private sourceNode: MediaElementAudioSourceNode | null = null;
-  /** 增益节点 */
-  private gainNode: GainNode | null = null;
-  /** 分析节点 */
-  private analyserNode: AnalyserNode | null = null;
-  /** 均衡器节点数组 */
-  private filters: BiquadFilterNode[] = [];
+  constructor(engineType: "ffmpeg" | "element") {
+    super();
 
-  /** 初始化状态 */
-  private isInitialized = false;
-  /** 音量 (0-1) */
-  private volume: number = 1;
-  /** 事件监听器集合 */
-  private eventListeners: Map<string, Set<(e: Event) => void>> = new Map();
-  /** 平滑后的低频音量 */
-  private smoothedLowFreqVolume: number = 0;
+    if (engineType === "ffmpeg") {
+      this.player = new FFmpegAudioPlayer();
+    } else {
+      this.player = new AudioElementPlayer();
+    }
+    this.engineType = engineType;
+    this.bindPlayerEvents();
+  }
 
-  /** 均衡器频段 (10段) */
-  private readonly eqFrequencies = [32, 64, 125, 250, 500, 1000, 2000, 4000, 8000, 16000];
+  private bindPlayerEvents() {
+    if (this.cleanupListeners) {
+      this.cleanupListeners();
+    }
 
-  /**
-   * 构造函数
-   */
-  constructor() {
-    this.audioElement = new Audio();
-    this.audioElement.crossOrigin = "anonymous";
-    this.bindInternalEvents();
+    const events = Object.values(AUDIO_EVENTS);
+    const handlers: Map<string, EventListener> = new Map();
+
+    events.forEach((eventType) => {
+      const handler = (e: Event) => {
+        if (e instanceof CustomEvent) {
+          this.dispatchEvent(new CustomEvent(eventType, { detail: e.detail }));
+        } else {
+          this.dispatchEvent(new Event(eventType));
+        }
+      };
+      handlers.set(eventType, handler);
+      this.player.addEventListener(eventType, handler);
+    });
+
+    this.cleanupListeners = () => {
+      handlers.forEach((handler, eventType) => {
+        this.player.removeEventListener(eventType as AudioEventType, handler);
+      });
+    };
   }
 
   /**
-   * 初始化 AudioContext 和音频图谱
-   * 可以在用户交互时手动调用，或者在播放时自动调用
+   * 初始化
+   *
+   * 通常在首次播放时自动调用，也可手动调用以预热 AudioContext
    */
   public init() {
-    if (this.isInitialized) return;
-
-    try {
-      // 使用标准 AudioContext
-      this.audioCtx = new AudioContext() as IExtendedAudioContext;
-
-      // 创建节点
-      this.sourceNode = this.audioCtx.createMediaElementSource(this.audioElement!);
-      this.gainNode = this.audioCtx.createGain();
-      this.analyserNode = this.audioCtx.createAnalyser();
-
-      // 配置分析器
-      this.analyserNode.fftSize = 512;
-
-      // 创建均衡器滤波器
-      this.filters = this.eqFrequencies.map((freq) => {
-        const filter = this.audioCtx!.createBiquadFilter();
-        filter.type = "peaking";
-        filter.frequency.value = freq;
-        filter.Q.value = 1;
-        filter.gain.value = 0; // 默认平坦
-        return filter;
-      });
-
-      // 连接图谱: Source -> EQ[0] -> ... -> EQ[9] -> Analyser -> Gain -> Destination
-      let currentNode: AudioNode = this.sourceNode;
-
-      for (const filter of this.filters) {
-        currentNode.connect(filter);
-        currentNode = filter;
-      }
-
-      currentNode.connect(this.analyserNode);
-      this.analyserNode.connect(this.gainNode);
-      this.gainNode.connect(this.audioCtx.destination);
-
-      // 同步音量
-      this.gainNode.gain.value = this.volume;
-
-      this.isInitialized = true;
-    } catch (error) {
-      console.error("AudioManager: 初始化 AudioContext 失败", error);
-    }
+    this.player.init();
   }
 
   /**
@@ -122,96 +77,31 @@ class AudioManager {
    */
   public async play(
     url?: string,
-    options: { fadeIn?: boolean; fadeDuration?: number; autoPlay?: boolean } = {},
+    options?: { fadeIn?: boolean; fadeDuration?: number; autoPlay?: boolean },
   ) {
-    // 自动播放控制
-    const shouldPlay = options.autoPlay ?? true;
-    // 不初始化 AudioContext
-    if (!shouldPlay) {
-      if (url && this.audioElement) {
-        this.audioElement.src = url;
-        this.audioElement.load();
-      }
-      return;
-    }
-    // 需要播放时才初始化 AudioContext
-    if (!this.isInitialized) this.init();
-
-    // 如果上下文被挂起，则恢复
-    if (this.audioCtx?.state === "suspended") {
-      await this.audioCtx.resume();
-    }
-
-    if (url && this.audioElement) {
-      this.audioElement.src = url;
-      this.audioElement.load();
-    }
-
-    // 处理渐入
-    if (options.fadeIn && this.gainNode && this.audioCtx) {
-      this.gainNode.gain.cancelScheduledValues(this.audioCtx.currentTime);
-      this.gainNode.gain.setValueAtTime(0, this.audioCtx.currentTime);
-      this.gainNode.gain.linearRampToValueAtTime(
-        this.volume,
-        this.audioCtx.currentTime + (options.fadeDuration || 1),
-      );
-    } else if (this.gainNode && this.audioCtx) {
-      this.gainNode.gain.cancelScheduledValues(this.audioCtx.currentTime);
-      this.gainNode.gain.setValueAtTime(this.volume, this.audioCtx.currentTime);
-    }
-
-    try {
-      await this.audioElement?.play();
-    } catch (error) {
-      console.error("AudioManager: 播放失败", error);
-      throw error;
-    }
+    await this.player.play(url, options);
   }
 
   /**
    * 暂停音频
    * @param options 暂停选项 (fadeOut: 是否渐出, fadeDuration: 渐出时长)
    */
-  public pause(options: { fadeOut?: boolean; fadeDuration?: number } = {}) {
-    if (options.fadeOut && this.gainNode && this.audioCtx) {
-      const currentTime = this.audioCtx.currentTime;
-      // 从当前值线性降低到 0
-      this.gainNode.gain.cancelScheduledValues(currentTime);
-      this.gainNode.gain.setValueAtTime(this.gainNode.gain.value, currentTime);
-      this.gainNode.gain.linearRampToValueAtTime(0, currentTime + (options.fadeDuration || 1));
-      // 等待渐出完成后暂停
-      setTimeout(
-        () => {
-          this.audioElement?.pause();
-        },
-        (options.fadeDuration || 1) * 1000,
-      );
-    } else {
-      this.audioElement?.pause();
-    }
-  }
-
-  /**
-   * 切换播放/暂停状态
-   */
-  public toggle() {
-    if (this.paused) {
-      this.play();
-    } else {
-      this.pause();
-    }
+  public pause(options?: { fadeOut?: boolean; fadeDuration?: number }) {
+    this.player.pause(options);
   }
 
   /**
    * 停止播放并将时间重置为 0
    */
   public stop() {
-    if (this.audioElement) {
-      this.pause();
-      this.audioElement.currentTime = 0;
-      this.audioElement.removeAttribute("src");
-      this.audioElement.load();
-    }
+    this.player.stop();
+  }
+
+  /**
+   * 切换播放/暂停
+   */
+  public togglePlayPause() {
+    this.player.togglePlayPause();
   }
 
   /**
@@ -219,9 +109,7 @@ class AudioManager {
    * @param time 时间（秒）
    */
   public seek(time: number) {
-    if (this.audioElement) {
-      this.audioElement.currentTime = time;
-    }
+    this.player.seek(time);
   }
 
   /**
@@ -229,29 +117,7 @@ class AudioManager {
    * @param value 音量值 (0.0 - 1.0)
    */
   public setVolume(value: number) {
-    this.volume = Math.max(0, Math.min(1, value));
-    if (this.gainNode && this.audioCtx) {
-      this.gainNode.gain.cancelScheduledValues(this.audioCtx.currentTime);
-      this.gainNode.gain.setValueAtTime(this.volume, this.audioCtx.currentTime);
-    }
-  }
-
-  /**
-   * 设置播放速率
-   * @param value 速率 (0.5 - 2.0)
-   */
-  public setRate(value: number) {
-    if (this.audioElement) {
-      this.audioElement.playbackRate = value;
-    }
-  }
-
-  /**
-   * 获取当前播放速率
-   * @returns 当前速率
-   */
-  public getRate(): number {
-    return this.audioElement?.playbackRate || 1;
+    this.player.setVolume(value);
   }
 
   /**
@@ -259,82 +125,30 @@ class AudioManager {
    * @returns 当前音量值 (0.0 - 1.0)
    */
   public getVolume(): number {
-    return this.volume;
+    return this.player.getVolume();
   }
 
   /**
-   * 监听音频事件
-   * @param event 事件名称
-   * @param callback 回调函数
+   * 设置播放速率
+   * @param value 速率 (0.5 - 2.0)
    */
-  public on(event: AudioEventType, callback: (e: Event) => void) {
-    if (!this.eventListeners.has(event)) {
-      this.eventListeners.set(event, new Set());
-    }
-    this.eventListeners.get(event)!.add(callback);
+  public setRate(value: number) {
+    this.player.setRate(value);
   }
 
   /**
-   * 移除事件监听
-   * @param event 事件名称
-   * @param callback 回调函数
+   * 获取当前播放速率
+   * @returns 当前速率
    */
-  public off(event: AudioEventType, callback: (e: Event) => void) {
-    const listeners = this.eventListeners.get(event);
-    if (listeners) {
-      listeners.delete(callback);
-    }
+  public getRate(): number {
+    return this.player.getRate();
   }
 
   /**
-   * 移除所有事件监听
+   * 设置输出设备
    */
-  public offAll() {
-    this.eventListeners.clear();
-  }
-
-  /**
-   * 绑定内部音频元素事件并转发
-   * @param event 事件名称
-   */
-  private bindInternalEvents() {
-    if (!this.audioElement) return;
-
-    const events: AudioEventType[] = [
-      "play",
-      "pause",
-      "ended",
-      "timeupdate",
-      "error",
-      "waiting",
-      "canplay",
-      "loadedmetadata",
-      "loadstart",
-      "volumechange",
-      "seeking",
-      "seeked",
-    ];
-
-    events.forEach((event) => {
-      this.audioElement!.addEventListener(event, (e) => {
-        // 传递错误码
-        if (event === "error" && this.audioElement) {
-          const errCode = this.getErrorCode();
-          const customEvent = new CustomEvent("error", {
-            detail: { originalEvent: e, errorCode: errCode },
-          });
-          const listeners = this.eventListeners.get(event);
-          if (listeners) {
-            listeners.forEach((cb) => cb(customEvent));
-          }
-        } else {
-          const listeners = this.eventListeners.get(event);
-          if (listeners) {
-            listeners.forEach((cb) => cb(e));
-          }
-        }
-      });
-    });
+  public async setSinkId(deviceId: string) {
+    await this.player.setSinkId(deviceId);
   }
 
   /**
@@ -342,10 +156,7 @@ class AudioManager {
    * @returns Uint8Array 频谱数据
    */
   public getFrequencyData(): Uint8Array {
-    if (!this.analyserNode) return new Uint8Array(0);
-    const dataArray = new Uint8Array(this.analyserNode.frequencyBinCount);
-    this.analyserNode.getByteFrequencyData(dataArray);
-    return dataArray;
+    return this.player.getFrequencyData();
   }
 
   /**
@@ -354,48 +165,7 @@ class AudioManager {
    * @returns 低频音量值
    */
   public getLowFrequencyVolume(): number {
-    if (!this.analyserNode) return 0;
-    const dataArray = new Uint8Array(this.analyserNode.frequencyBinCount);
-    this.analyserNode.getByteFrequencyData(dataArray);
-    // 低频范围：前 3 个 bin (约 0-280Hz，基于 512 FFT 和约 48kHz 采样率)
-    const lowFreqBins = dataArray.slice(0, 3);
-    const sum = lowFreqBins.reduce((acc, val) => acc + val, 0);
-    const avg = sum / lowFreqBins.length;
-    // 使用阈值和幂函数扩展动态范围
-    // 通常低频能量较高（约 200-255），我们需要将其映射到更有意义的范围
-    const threshold = 180; // 低于此值视为静音
-    const maxValue = 255;
-    // 计算超过阈值的部分
-    const normalized = Math.max(0, (avg - threshold) / (maxValue - threshold));
-    // 应用幂函数扩展动态范围 (使低值更低，高值保持)
-    const rawValue = Math.pow(normalized, 2);
-    // 应用指数移动平均 (EMA) 平滑处理
-    // smoothFactor 越小平滑效果越明显，0.1-0.3 较为平缓
-    const smoothFactor = 0.28;
-    this.smoothedLowFreqVolume =
-      this.smoothedLowFreqVolume + smoothFactor * (rawValue - this.smoothedLowFreqVolume);
-    return this.smoothedLowFreqVolume;
-  }
-
-  /**
-   * 设置音频输出设备
-   * @param deviceId 设备 ID
-   */
-  public async setSinkId(deviceId: string) {
-    if (deviceId === "default") return;
-    try {
-      // 优先在 Context 上设置
-      if (this.isInitialized && this.audioCtx && typeof this.audioCtx.setSinkId === "function") {
-        await this.audioCtx.setSinkId(deviceId);
-        return;
-      }
-      // 回退到在 HTMLAudioElement 上设置
-      if (this.audioElement && typeof this.audioElement.setSinkId === "function") {
-        await this.audioElement.setSinkId(deviceId);
-      }
-    } catch (error) {
-      console.error("AudioManager: 设置输出设备失败", error);
-    }
+    return this.player.getLowFrequencyVolume();
   }
 
   /**
@@ -404,9 +174,7 @@ class AudioManager {
    * @param value 增益值 (-40 to 40)
    */
   public setFilterGain(index: number, value: number) {
-    if (this.filters[index]) {
-      this.filters[index].gain.value = value;
-    }
+    this.player.setFilterGain(index, value);
   }
 
   /**
@@ -414,7 +182,7 @@ class AudioManager {
    * @returns 各频段增益值数组
    */
   public getFilterGains(): number[] {
-    return this.filters.map((f) => f.gain.value);
+    return this.player.getFilterGains();
   }
 
   /**
@@ -422,7 +190,7 @@ class AudioManager {
    * @returns 总时长（秒）
    */
   public get duration() {
-    return this.audioElement?.duration || 0;
+    return this.player.duration;
   }
 
   /**
@@ -430,7 +198,7 @@ class AudioManager {
    * @returns 当前播放时间（秒）
    */
   public get currentTime() {
-    return this.audioElement?.currentTime || 0;
+    return this.player.currentTime;
   }
 
   /**
@@ -438,7 +206,7 @@ class AudioManager {
    * @returns 是否暂停
    */
   public get paused() {
-    return this.audioElement?.paused ?? true;
+    return this.player.paused;
   }
 
   /**
@@ -446,7 +214,7 @@ class AudioManager {
    * @returns 当前播放地址
    */
   public get src() {
-    return this.audioElement?.src || "";
+    return this.player.src;
   }
 
   /**
@@ -454,25 +222,23 @@ class AudioManager {
    * @returns 错误码
    */
   public getErrorCode(): number {
-    if (!this.audioElement?.error) return 0;
+    return this.player.getErrorCode();
+  }
 
-    // 参考 HTML Audio Element 错误码
-    // MEDIA_ERR_ABORTED (1): 用户中止了加载
-    // MEDIA_ERR_NETWORK (2): 网络错误或资源过期
-    // MEDIA_ERR_DECODE (3): 解码错误
-    // MEDIA_ERR_SRC_NOT_SUPPORTED (4): 不支持的格式
-    switch (this.audioElement.error.code) {
-      case MediaError.MEDIA_ERR_ABORTED:
-        return 1;
-      case MediaError.MEDIA_ERR_NETWORK:
-        return 2; // 网络错误或资源过期
-      case MediaError.MEDIA_ERR_DECODE:
-        return 3;
-      case MediaError.MEDIA_ERR_SRC_NOT_SUPPORTED:
-        return 4;
-      default:
-        return 0;
-    }
+  public override addEventListener<K extends keyof AudioEventMap>(
+    type: K,
+    listener: (this: AudioManager, ev: AudioEventMap[K]) => unknown,
+    options?: boolean | AddEventListenerOptions,
+  ): void {
+    super.addEventListener(type, listener as EventListenerOrEventListenerObject, options);
+  }
+
+  public override removeEventListener<K extends keyof AudioEventMap>(
+    type: K,
+    listener: (this: AudioManager, ev: AudioEventMap[K]) => unknown,
+    options?: boolean | EventListenerOptions,
+  ): void {
+    super.removeEventListener(type, listener as EventListenerOrEventListenerObject, options);
   }
 }
 
@@ -483,6 +249,9 @@ let instance: AudioManager | null = null;
  * @returns AudioManager
  */
 export const useAudioManager = (): AudioManager => {
-  if (!instance) instance = new AudioManager();
+  if (!instance) {
+    const settingStore = useSettingStore();
+    instance = new AudioManager(settingStore.audioEngine);
+  }
   return instance;
 };

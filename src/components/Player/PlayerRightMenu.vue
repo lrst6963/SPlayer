@@ -10,6 +10,7 @@
       :options="controlsOptions"
       :show-arrow="false"
       :class="{ player: statusStore.showFullPlayer }"
+      @select="handleControls"
     >
       <div class="menu-icon">
         <SvgIcon name="Controls" />
@@ -69,7 +70,7 @@ const statusStore = useStatusStore();
 const settingStore = useSettingStore();
 const player = usePlayerController();
 
-// 播放速度下拉菜单
+// 更多功能
 const controlsOptions = computed<DropdownOption[]>(() => [
   {
     label: "均衡器",
@@ -90,19 +91,29 @@ const controlsOptions = computed<DropdownOption[]>(() => [
     label: "自动关闭",
     key: "autoClose",
     icon: renderIcon("TimeAuto"),
-    props: {
-      onClick: () => openAutoClose(),
-    },
   },
   {
     label: "播放速度",
     key: "rate",
+    disabled: settingStore.audioEngine === "ffmpeg",
     icon: renderIcon("PlayRate"),
-    props: {
-      onClick: () => openChangeRate(),
-    },
   },
 ]);
+
+// 更多功能选择
+const handleControls = (key: string) => {
+  switch (key) {
+    case "equalizer":
+      openEqualizer();
+      break;
+    case "autoClose":
+      openAutoClose();
+      break;
+    case "rate":
+      openChangeRate();
+      break;
+  }
+};
 </script>
 
 <style scoped lang="scss">

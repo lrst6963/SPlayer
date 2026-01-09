@@ -245,6 +245,7 @@ const toGithub = () => {
       }
       .set {
         justify-content: flex-end;
+        min-width: 200px;
         width: 200px;
         &.n-switch {
           width: max-content;
