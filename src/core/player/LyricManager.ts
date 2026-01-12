@@ -399,8 +399,8 @@ class LyricManager {
       }
       // 先返回一次，避免 TTML 请求过慢
       if (qqMusicAdopted) {
-        const lyricData = this.handleLyricExclude(result);
-        this.setFinalLyric(lyricData, req);
+        const tempResult = this.handleLyricExclude(result);
+        this.setFinalLyric(tempResult, req);
       }
     };
 
@@ -448,7 +448,40 @@ class LyricManager {
       let yrcLines: LyricLine[] = [];
       // 普通歌词
       if (data?.lrc?.lyric) {
-        lrcLines = parseLrc(data.lrc.lyric) || [];
+        // 提取 JSON 格式的元数据行（作词、作曲、编曲等）
+        const lines = data.lrc.lyric.split('\n');
+        const metadataLines: string[] = [];
+        const lrcContentLines: string[] = [];
+        
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (trimmed.startsWith('{') && trimmed.includes('"c":[')) {
+            // JSON 格式的元数据行，提取文本内容
+            try {
+              const json = JSON.parse(trimmed);
+              if (json.c && Array.isArray(json.c)) {
+                const text = json.c.map((item: any) => item.tx || '').join('');
+                if (text) {
+                  // 转换为 LRC 格式，使用时间戳作为时间标记
+                  // 注意：如果时间为负数，转换为 0
+                  const time = Math.max(0, json.t || 0);
+                  const minutes = Math.floor(time / 60000);
+                  const seconds = Math.floor((time % 60000) / 1000);
+                  const milliseconds = time % 1000;
+                  metadataLines.push(`[${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}.${String(milliseconds).padStart(3, '0')}]${text}`);
+                }
+              }
+            } catch (e) {
+              // 解析失败，跳过
+            }
+          } else if (trimmed) {
+            lrcContentLines.push(line);
+          }
+        }
+        
+        // 合并元数据行和歌词内容
+        const fullLrc = [...metadataLines, ...lrcContentLines].join('\n');
+        lrcLines = parseLrc(fullLrc) || [];
         // 普通歌词翻译
         if (data?.tlyric?.lyric)
           lrcLines = this.alignLyrics(lrcLines, parseLrc(data.tlyric.lyric), "translatedLyric");
@@ -458,7 +491,106 @@ class LyricManager {
       }
       // 逐字歌词
       if (data?.yrc?.lyric) {
-        yrcLines = parseYrc(data.yrc.lyric) || [];
+        // 调试：输出原始 YRC 数据（前 2000 字符）与长度
+        // try {
+        //   const rawYrc = String(data.yrc.lyric);
+        //   console.groupCollapsed(`[YRC Debug] 原始逐字歌词: len=${rawYrc.length}`);
+        //   console.log(rawYrc.substring(0, 2000));
+        //   console.groupEnd();
+        // } catch {}
+        // 提取 JSON 格式的元数据行（作词、作曲、编曲等）
+        const yrcRawLines = data.yrc.lyric.split('\n');
+        const yrcMetadataLines: string[] = [];
+        const yrcContentLines: string[] = [];
+        
+        for (const line of yrcRawLines) {
+          const trimmed = line.trim();
+          if (trimmed.startsWith('{') && trimmed.includes('"c":[')) {
+            // JSON 格式的元数据行，提取文本内容
+            try {
+              const json = JSON.parse(trimmed);
+              if (json.c && Array.isArray(json.c)) {
+                const text = json.c.map((item: any) => item.tx || '').join('');
+                if (text) {
+                  // 转换为 LRC 格式，使用时间戳作为时间标记
+                  // 注意：如果时间为负数，转换为 0
+                  const time = Math.max(0, json.t || 0);
+                  const minutes = Math.floor(time / 60000);
+                  const seconds = Math.floor((time % 60000) / 1000);
+                  const milliseconds = time % 1000;
+                  yrcMetadataLines.push(`[${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}.${String(milliseconds).padStart(3, '0')}]${text}`);
+                }
+              }
+            } catch (e) {
+              // 解析失败，跳过
+            }
+          } else if (trimmed) {
+            yrcContentLines.push(line);
+          }
+        }
+        
+        // 分别解析元数据（用 parseLrc）和 YRC 内容（用 parseYrc）
+        const metadataLrcLines = yrcMetadataLines.length > 0 
+          ? parseLrc(yrcMetadataLines.join('\n')) || []
+          : [];
+        const yrcContent = yrcContentLines.join('\n');
+        const yrcContentParsed = parseYrc(yrcContent) || [];
+        // 调试：输出拆分统计
+        // console.groupCollapsed('[YRC Debug] 拆分统计');
+        // console.log({ metadataCount: yrcMetadataLines.length, contentLineCount: yrcContentLines.length, parsedLineCount: yrcContentParsed.length });
+        // if (yrcContentParsed.length) {
+        //   const preview = yrcContentParsed.slice(0, 3).map((line) => line.words?.map((w) => w.word).join('') || '');
+        //   console.log('解析后前3行:', preview);
+        // }
+        // console.groupEnd();
+        
+        // 将元数据转换为 YRC 行并标记为背景（isBG），使其显示但不影响索引计算
+        const lastYrcLine2 = yrcContentParsed[yrcContentParsed.length - 1];
+        const lastEndTime2 = lastYrcLine2?.endTime || Number.MAX_SAFE_INTEGER;
+        const metadataYrcLines = metadataLrcLines.map((line) => ({
+          words: [
+            {
+              word: line.words?.map((w) => w.word)?.join("") || "",
+              startTime: line.startTime || 0,
+              endTime: lastEndTime2,
+              romanWord: "",
+            },
+          ],
+          startTime: line.startTime || 0,
+          endTime: lastEndTime2,
+          translatedLyric: line.translatedLyric || "",
+          romanLyric: line.romanLyric || "",
+          isBG: true,
+          isDuet: false,
+        }));
+
+        // 合并：背景元数据 + 真实 YRC 行
+        yrcLines = [...metadataYrcLines, ...yrcContentParsed];
+        
+        // 如果没有普通歌词，使用元数据 + YRC 内容作为普通歌词用于显示
+        if (!result.lrcData.length && metadataLrcLines.length > 0) {
+          // 将元数据的 endTime 设置为最后一行的结束时间，使其永远显示
+          const lastYrcLine = yrcContentParsed[yrcContentParsed.length - 1];
+          const lastEndTime = lastYrcLine?.endTime || Number.MAX_SAFE_INTEGER;
+          
+          // 修改元数据行的 endTime，使其永远不会消失
+          const metadataWithLargeEndTime = metadataLrcLines.map((line) => ({
+            ...line,
+            endTime: lastEndTime,
+          }));
+          
+          result.lrcData = [...metadataWithLargeEndTime, ...yrcContentParsed.map((line) => ({
+            ...line,
+            words: [
+              {
+                word: line.words?.map((w) => w.word)?.join("") || "",
+                startTime: line.startTime || 0,
+                endTime: line.endTime || 0,
+                romanWord: line.words?.map((w) => w.romanWord)?.join("") || "",
+              },
+            ],
+          }))];
+        }
         // 逐字歌词翻译
         if (data?.ytlrc?.lyric)
           yrcLines = this.alignLyrics(yrcLines, parseLrc(data.ytlrc.lyric), "translatedLyric");
@@ -466,14 +598,21 @@ class LyricManager {
         if (data?.yromalrc?.lyric)
           yrcLines = this.alignLyrics(yrcLines, parseLrc(data.yromalrc.lyric), "romanLyric");
       }
-      if (lrcLines.length) result.lrcData = lrcLines;
+      if (lrcLines.length) {
+        // 如果 result.lrcData 已经有数据（比如元数据），则合并而不是覆盖
+        if (result.lrcData.length > 0) {
+          result.lrcData = [...result.lrcData, ...lrcLines];
+        } else {
+          result.lrcData = lrcLines;
+        }
+      }
       // 如果没有 TTML，则采用 网易云 YRC
       if (!result.yrcData.length && yrcLines.length) {
         result.yrcData = yrcLines;
       }
       // 先返回一次，避免 TTML 请求过慢
-      const lyricData = this.handleLyricExclude(result);
-      this.setFinalLyric(lyricData, req);
+      const tempResult = this.handleLyricExclude(result);
+      this.setFinalLyric(tempResult, req);
     };
     // 优先获取 QQ 音乐歌词
     if (settingStore.preferQQMusicLyric) {
